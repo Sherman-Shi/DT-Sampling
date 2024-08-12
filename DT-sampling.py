@@ -24,7 +24,7 @@ class TrainConfig:
     # wandb params
     project: str = "DT_Sampling"
     group: str = "DT-D4RL"
-    name: str = "DT"
+    name: str = "DT-SAR"
     # model params
     embedding_dim: int = 128
     num_layers: int = 3
@@ -48,7 +48,7 @@ class TrainConfig:
     num_workers: int = 4
     # evaluation params
     target_returns: Tuple[float, ...] = (12000.0, 6000.0)
-    eval_episodes: int = 100
+    eval_episodes: int = 25
     eval_every: int = 10_000
     # general params
     checkpoints_path: Optional[str] = None
@@ -290,6 +290,7 @@ class DecisionTransformer(nn.Module):
             ]
         )
         self.action_head = nn.Sequential(nn.Linear(embedding_dim, action_dim), nn.Tanh())
+        self.reward_head = nn.Sequential(nn.Linear(embedding_dim, 1), nn.Tanh())
         self.seq_len = seq_len
         self.embedding_dim = embedding_dim
         self.state_dim = state_dim
@@ -326,7 +327,7 @@ class DecisionTransformer(nn.Module):
 
         # [batch_size, seq_len * 3, emb_dim], (r_0, s_0, a_0, r_1, s_1, a_1, ...)
         sequence = (
-            torch.stack([returns_emb, state_emb, act_emb], dim=1)
+            torch.stack([state_emb, act_emb, returns_emb], dim=1)
             .permute(0, 2, 1, 3)
             .reshape(batch_size, 3 * seq_len, self.embedding_dim)
         )
@@ -347,9 +348,17 @@ class DecisionTransformer(nn.Module):
 
         out = self.out_norm(out)
         # [batch_size, seq_len, action_dim]
-        # predict actions only from state embeddings
-        out = self.action_head(out[:, 1::3]) * self.max_action
-        return out
+        # Extract state, action, and reward embeddings from the sequence
+        state_emb_out = out[:, 0::3]  # State embeddings
+        action_emb_out = out[:, 1::3]  # Action embeddings
+        # returns_emb_out = out[:, 2::3]  # Reward embeddings
+
+        # Predict actions from action embeddings
+        action_out = self.action_head(state_emb_out) * self.max_action
+
+        # Predict rewards from reward embeddings
+        returns_out = self.reward_head(action_emb_out)  # Define this head in the
+        return action_out, returns_out
 
 
 # Training and evaluation logic
@@ -371,7 +380,9 @@ def eval_rollout(
     time_steps = time_steps.view(1, -1)
 
     states[:, 0] = torch.as_tensor(env.reset(), device=device)
-    returns[:, 0] = torch.as_tensor(target_return, device=device)
+
+    # Origin DT:
+    # returns[:, 0] = torch.as_tensor(target_return, device=device)
 
     # cannot step higher than model episode len, as timestep embeddings will crash
     episode_return, episode_len = 0.0, 0.0
@@ -379,7 +390,7 @@ def eval_rollout(
         # first select history up to step, then select last seq_len states,
         # step + 1 as : operator is not inclusive, last action is dummy with zeros
         # (as model will predict last, actual last values are not important)
-        predicted_actions = model(  # fix this noqa!!!
+        predicted_actions, predicted_returns = model(  # fix this noqa!!!
             states[:, : step + 1][:, -model.seq_len :],
             actions[:, : step + 1][:, -model.seq_len :],
             returns[:, : step + 1][:, -model.seq_len :],
@@ -390,7 +401,11 @@ def eval_rollout(
         # at step t, we predict a_t, get s_{t + 1}, r_{t + 1}
         actions[:, step] = torch.as_tensor(predicted_action)
         states[:, step + 1] = torch.as_tensor(next_state)
-        returns[:, step + 1] = torch.as_tensor(returns[:, step] - reward)
+
+        # Origin DT:
+        # returns[:, step + 1] = torch.as_tensor(returns[:, step] - reward)
+
+        returns[:, step] = predicted_returns[0, -1]
 
         episode_return += reward
         episode_len += 1
@@ -466,16 +481,21 @@ def train(config: TrainConfig):
         # True value indicates that the corresponding key value will be ignored
         padding_mask = ~mask.to(torch.bool)
 
-        predicted_actions = model(
+        predicted_actions, predicted_returns = model(
             states=states,
             actions=actions,
             returns_to_go=returns,
             time_steps=time_steps,
             padding_mask=padding_mask,
         )
-        loss = F.mse_loss(predicted_actions, actions.detach(), reduction="none")
+        # [batch_size, seq_len, 1] --> [batch_size, seq_len]
+        predicted_returns = predicted_returns.squeeze(-1)
         # [batch_size, seq_len, action_dim] * [batch_size, seq_len, 1]
-        loss = (loss * mask.unsqueeze(-1)).mean()
+        action_loss = (F.mse_loss(predicted_actions, actions.detach(), reduction="none") * mask.unsqueeze(-1)).mean()
+        reward_loss = (F.mse_loss(predicted_returns, returns.detach(), reduction="none") * mask).mean()
+        loss = action_loss + reward_loss
+
+
 
         optim.zero_grad()
         loss.backward()
