@@ -23,7 +23,7 @@ from tqdm.auto import tqdm, trange  # noqa
 class TrainConfig:
     # wandb params
     project: str = "DT_Sampling"
-    group: str = "DT-SAR-D4RL"
+    group: str = "DT-SAR-ActionSampling-D4RL"
     name: str = "DT-SAR"
     # model params
     embedding_dim: int = 128
@@ -47,7 +47,7 @@ class TrainConfig:
     reward_scale: float = 0.001
     num_workers: int = 4
     # evaluation params
-    target_returns: Tuple[float, ...] = (12000.0, 6000.0)
+    target_returns: Tuple[float, ...] = (12000.0, )
     eval_episodes: int = 25
     eval_every: int = 10_000
     # general params
@@ -289,7 +289,20 @@ class DecisionTransformer(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.action_head = nn.Sequential(nn.Linear(embedding_dim, action_dim), nn.Tanh())
+        # Output mean and log standard deviation with nonlinearity
+        self.action_mean_head = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.ReLU(),
+            nn.Linear(embedding_dim, action_dim),
+            nn.Tanh()  # or any other suitable activation
+        )
+        
+        self.action_log_std_head = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.ReLU(),
+            nn.Linear(embedding_dim, action_dim),
+            nn.Tanh()  # or any other suitable activation
+        )
         self.reward_head = nn.Sequential(nn.Linear(embedding_dim, 1), nn.Tanh())
         self.seq_len = seq_len
         self.embedding_dim = embedding_dim
@@ -353,12 +366,18 @@ class DecisionTransformer(nn.Module):
         action_emb_out = out[:, 1::3]  # Action embeddings
         # returns_emb_out = out[:, 2::3]  # Reward embeddings
 
-        # Predict actions from action embeddings
-        action_out = self.action_head(state_emb_out) * self.max_action
+        # Predict mean and log standard deviation from action embeddings
+        action_mean = self.action_mean_head(state_emb_out) * self.max_action
+        action_log_std = self.action_log_std_head(state_emb_out)
+        action_std = torch.exp(action_log_std)
+
+        # Reparameterization trick for sampling
+        epsilon = torch.randn_like(action_std)
+        sampled_actions = action_mean + action_std * epsilon
 
         # Predict rewards from reward embeddings
-        returns_out = self.reward_head(action_emb_out)  # Define this head in the
-        return action_out, returns_out
+        returns_out = self.reward_head(action_emb_out)
+        return sampled_actions, returns_out
 
 
 # Training and evaluation logic

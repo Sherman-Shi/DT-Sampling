@@ -23,8 +23,8 @@ from tqdm.auto import tqdm, trange  # noqa
 class TrainConfig:
     # wandb params
     project: str = "DT_Sampling"
-    group: str = "DT-SAR-D4RL"
-    name: str = "DT-SAR"
+    group: str = "DT-SRA-D4RL"
+    name: str = "DT-SRA"
     # model params
     embedding_dim: int = 128
     num_layers: int = 3
@@ -327,7 +327,7 @@ class DecisionTransformer(nn.Module):
 
         # [batch_size, seq_len * 3, emb_dim], (r_0, s_0, a_0, r_1, s_1, a_1, ...)
         sequence = (
-            torch.stack([state_emb, act_emb, returns_emb], dim=1)
+            torch.stack([state_emb, returns_emb, act_emb], dim=1)
             .permute(0, 2, 1, 3)
             .reshape(batch_size, 3 * seq_len, self.embedding_dim)
         )
@@ -350,14 +350,14 @@ class DecisionTransformer(nn.Module):
         # [batch_size, seq_len, action_dim]
         # Extract state, action, and reward embeddings from the sequence
         state_emb_out = out[:, 0::3]  # State embeddings
-        action_emb_out = out[:, 1::3]  # Action embeddings
+        returns_emb_out = out[:, 1::3]  # Action embeddings
         # returns_emb_out = out[:, 2::3]  # Reward embeddings
 
         # Predict actions from action embeddings
-        action_out = self.action_head(state_emb_out) * self.max_action
+        action_out = self.action_head(returns_emb_out) * self.max_action
 
         # Predict rewards from reward embeddings
-        returns_out = self.reward_head(action_emb_out)  # Define this head in the
+        returns_out = self.reward_head(state_emb_out)  # Define this head in the
         return action_out, returns_out
 
 
