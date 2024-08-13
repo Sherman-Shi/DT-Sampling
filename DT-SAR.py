@@ -23,7 +23,7 @@ from tqdm.auto import tqdm, trange  # noqa
 class TrainConfig:
     # wandb params
     project: str = "DT_Sampling"
-    group: str = "DT-D4RL"
+    group: str = "DT-SAR-D4RL"
     name: str = "DT-SAR"
     # model params
     embedding_dim: int = 128
