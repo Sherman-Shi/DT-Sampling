@@ -18,6 +18,8 @@ import wandb
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm.auto import tqdm, trange  # noqa
+from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
 
 @dataclass
 class TrainConfig:
@@ -29,7 +31,7 @@ class TrainConfig:
     embedding_dim: int = 128
     num_layers: int = 3
     num_heads: int = 1
-    seq_len: int = 20
+    seq_len: int = 3
     episode_len: int = 1000
     attention_dropout: float = 0.1
     residual_dropout: float = 0.1
@@ -42,22 +44,23 @@ class TrainConfig:
     weight_decay: float = 1e-4
     clip_grad: Optional[float] = 0.25
     batch_size: int = 64
-    update_steps: int = 100_000
+    update_steps: int = 50_000
     warmup_steps: int = 10_000
     reward_scale: float = 0.001
     num_workers: int = 4
     reward_grid_size: int = 1000  # Define the number of discrete reward points in the grid
     min_reward: float = 0.0    # Define the minimum possible reward
-    max_reward: float = 15000.0     # Define the maximum possible reward
+    max_reward: float = 15.0     # Define the maximum possible reward
+    reward_loss_weight: float = 0.1
     # evaluation params
     target_returns: Tuple[float, ...] = (12000.0, 6000.0)
-    eval_episodes: int = 25
-    eval_every: int = 10_000
+    eval_episodes: int = 10
+    eval_every: int = 5_000
     # general params
     checkpoints_path: Optional[str] = None
     deterministic_torch: bool = False
-    train_seed: int = 10
-    eval_seed: int = 42
+    train_seed: int = 15
+    eval_seed: int = 47
     device: str = "cuda"
 
     def __post_init__(self):
@@ -365,6 +368,36 @@ class DecisionTransformer(nn.Module):
         return action_out, returns_out
 
 
+def plot_pdf(reward_logits_record, reward_grid, step, config, num_grids=100, save_dir="pdf_plots"):
+    # Ensure the save directory exists
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Define a new grid of 100 points across the range of the original reward grid
+    new_reward_grid = np.linspace(reward_grid.min(), reward_grid.max(), num_grids)
+
+    for i, logits in enumerate(reward_logits_record):
+        # Interpolate logits to match the new grid
+        interpolation_function = interp1d(reward_grid, logits, kind='linear', fill_value="extrapolate")
+        interpolated_logits = interpolation_function(new_reward_grid)
+
+        # Normalize interpolated logits to ensure they sum to 1 (convert to probability)
+        interpolated_logits /= interpolated_logits.sum()
+
+        # Plotting the interpolated PDF
+        plt.figure(figsize=(8, 6))
+        plt.plot(new_reward_grid, interpolated_logits)
+        plt.xlabel("Reward")
+        plt.ylabel("Probability")
+        plt.title(f"Predicted Reward PDF at Step {step}, Logits Set {i+1}")
+        plt.grid(True)
+        
+        # Save each plot locally with unique identifier for each logit set
+        save_path = os.path.join(save_dir, f"{config.name}_reward_pdf_step_{step}_set_{i+1}.png")
+        plt.savefig(save_path)
+        plt.close()
+        
+        print(f"Saved PDF plot for logits set {i+1} at step {step} to {save_path}")
+        
 # Training and evaluation logic
 @torch.no_grad()
 def eval_rollout(
@@ -392,6 +425,7 @@ def eval_rollout(
 
     # cannot step higher than model episode len, as timestep embeddings will crash
     episode_return, episode_len = 0.0, 0.0
+    reward_logits_record = []
     for step in range(model.episode_len):
         # first select history up to step, then select last seq_len states,
         # step + 1 as : operator is not inclusive, last action is dummy with zeros
@@ -404,6 +438,7 @@ def eval_rollout(
         )
         predicted_reward_probs = F.softmax(predicted_returns[0, -1], dim=-1)
         predicted_reward = (predicted_reward_probs * reward_grid).sum()
+        reward_logits_record.append(predicted_reward_probs.cpu().numpy())  # Record logits
         
         predicted_action = predicted_actions[0, -1].cpu().numpy()
         next_state, reward, done, info = env.step(predicted_action)
@@ -422,7 +457,7 @@ def eval_rollout(
         if done:
             break
 
-    return episode_return, episode_len
+    return episode_return, episode_len, reward_logits_record
 
 
 @pyrallis.wrap()
@@ -506,7 +541,7 @@ def train(config: TrainConfig):
         reward_targets = torch.bucketize(returns, reward_grid).view(-1)
         reward_logits = reward_logits.view(-1, config.reward_grid_size)
         reward_loss = F.cross_entropy(reward_logits, reward_targets).mean()
-        loss = action_loss + reward_loss
+        loss = action_loss + config.reward_loss_weight * reward_loss
 
 
 
@@ -533,8 +568,10 @@ def train(config: TrainConfig):
             for target_return in config.target_returns:
                 eval_env.seed(config.eval_seed)
                 eval_returns = []
+                reward_logits_accum = []  # Reset for each evaluation
+
                 for _ in trange(config.eval_episodes, desc="Evaluation", leave=False):
-                    eval_return, eval_len = eval_rollout(
+                    eval_return, eval_len, reward_logits = eval_rollout(
                         model=model,
                         env=eval_env,
                         target_return=target_return * config.reward_scale,
@@ -543,6 +580,16 @@ def train(config: TrainConfig):
                     )
                     # unscale for logging & correct normalized score computation
                     eval_returns.append(eval_return / config.reward_scale)
+                    reward_logits_accum.extend(reward_logits)  # Store all logits
+
+                # Draw a random sample of 10 logits or fewer if less than 10 available
+                if len(reward_logits_accum) > 20:
+                    sampled_logits = random.sample(reward_logits_accum, 20)
+                else:
+                    sampled_logits = reward_logits_accum
+
+                # Plot the PDF using the sampled logits
+                plot_pdf(sampled_logits, reward_grid.cpu().numpy(), step, config=config)
 
                 normalized_scores = (
                     eval_env.get_normalized_score(np.array(eval_returns)) * 100
