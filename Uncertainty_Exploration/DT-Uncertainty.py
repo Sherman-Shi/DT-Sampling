@@ -59,8 +59,8 @@ class TrainConfig:
     # general params
     checkpoints_path: Optional[str] = None
     deterministic_torch: bool = False
-    train_seed: int = 19
-    eval_seed: int = 51
+    train_seed: int = 20
+    eval_seed: int = 52
     device: str = "cuda"
 
     def __post_init__(self):
@@ -368,6 +368,35 @@ class DecisionTransformer(nn.Module):
         return action_out, returns_out
 
 
+def compute_epistemic_uncertainty(probs_matrix: np.ndarray, reward_grid: np.ndarray) -> float:
+    """
+    Computes the epistemic uncertainty (σ²_epi) for an ensemble of probability distributions.
+    
+    Parameters:
+    - probs_matrix (np.ndarray): Array of shape (M, N) where M is the number of models (ensembles)
+                                 and N is the number of reward grid points, representing each model's
+                                 probability distribution over the reward grid.
+    - reward_grid (np.ndarray): Array of shape (N,) representing the reward grid values.
+
+    Returns:
+    - float: The epistemic uncertainty (σ²_epi).
+    """
+    M, N = probs_matrix.shape
+    
+    # Step 1: Compute the ensemble mean distribution p(v_t | s_t)
+    mean_probs = np.mean(probs_matrix, axis=0)
+    
+    # Step 2: Compute the expected value of v_t for the mean distribution
+    ensemble_mean_value = np.sum(mean_probs * reward_grid)
+    
+    # Step 3: Compute the expected value of v_t for each model's distribution
+    individual_expected_values = np.sum(probs_matrix * reward_grid, axis=1)
+    
+    # Step 4: Calculate the epistemic uncertainty as variance of the model predictions around the mean
+    epistemic_uncertainty = (1 / M) * np.sum((individual_expected_values - ensemble_mean_value) ** 2)
+    
+    return epistemic_uncertainty
+
 def plot_pdf(predicted_reward_probs_record, reward_grid, step, config, num_grids=100, save_dir="pdf_plots"):
     # Ensure the save directory exists
     os.makedirs(save_dir, exist_ok=True)
@@ -376,6 +405,9 @@ def plot_pdf(predicted_reward_probs_record, reward_grid, step, config, num_grids
     new_reward_grid = np.linspace(reward_grid.min(), reward_grid.max(), num_grids)
     
     for i, probs_matrix in enumerate(predicted_reward_probs_record):
+        # Compute epistemic uncertainty for the current matrix
+        epistemic_uncertainty = compute_epistemic_uncertainty(probs_matrix, reward_grid)
+
         plt.figure(figsize=(8, 6))
 
         # Plot each row in the probability matrix as a separate line
@@ -392,7 +424,8 @@ def plot_pdf(predicted_reward_probs_record, reward_grid, step, config, num_grids
 
         plt.xlabel("Reward")
         plt.ylabel("Probability")
-        plt.title(f"Predicted Reward PDF at Step {step}, Matrix {i+1}")
+        plt.title(f"Predicted Value Distribution at Training Step {step} (Sample No. {i+1})\n"
+                  f"Epistemic Uncertainty (σ²_epi): {(epistemic_uncertainty*10000):.4f}")
         plt.grid(True)
         plt.legend()
 
