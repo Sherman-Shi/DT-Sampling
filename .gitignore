@@ -1,6 +1,7 @@
 wandb/
 runs/
 logs/
+Uncertainty_Exploration/pdf_plots/
 
 *.pyc
 *.log
