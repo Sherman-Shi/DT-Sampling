@@ -28,10 +28,10 @@ class TrainConfig:
     group: str = "DT-U-D4RL-dev"
     name: str = "DT-U-dev"
     # model params
-    embedding_dim: int = 128
-    num_layers: int = 3
+    embedding_dim: int = 256
+    num_layers: int = 5
     num_heads: int = 1
-    seq_len: int = 3
+    seq_len: int = 10
     episode_len: int = 1000
     attention_dropout: float = 0.1
     residual_dropout: float = 0.1
@@ -44,7 +44,7 @@ class TrainConfig:
     weight_decay: float = 1e-4
     clip_grad: Optional[float] = 0.25
     batch_size: int = 64
-    update_steps: int = 50_000
+    update_steps: int = 100_000
     warmup_steps: int = 10_000
     reward_scale: float = 0.001
     num_workers: int = 4
@@ -59,8 +59,8 @@ class TrainConfig:
     # general params
     checkpoints_path: Optional[str] = None
     deterministic_torch: bool = False
-    train_seed: int = 15
-    eval_seed: int = 47
+    train_seed: int = 19
+    eval_seed: int = 51
     device: str = "cuda"
 
     def __post_init__(self):
@@ -368,35 +368,40 @@ class DecisionTransformer(nn.Module):
         return action_out, returns_out
 
 
-def plot_pdf(reward_logits_record, reward_grid, step, config, num_grids=100, save_dir="pdf_plots"):
+def plot_pdf(predicted_reward_probs_record, reward_grid, step, config, num_grids=100, save_dir="pdf_plots"):
     # Ensure the save directory exists
     os.makedirs(save_dir, exist_ok=True)
 
     # Define a new grid of 100 points across the range of the original reward grid
     new_reward_grid = np.linspace(reward_grid.min(), reward_grid.max(), num_grids)
-
-    for i, logits in enumerate(reward_logits_record):
-        # Interpolate logits to match the new grid
-        interpolation_function = interp1d(reward_grid, logits, kind='linear', fill_value="extrapolate")
-        interpolated_logits = interpolation_function(new_reward_grid)
-
-        # Normalize interpolated logits to ensure they sum to 1 (convert to probability)
-        interpolated_logits /= interpolated_logits.sum()
-
-        # Plotting the interpolated PDF
+    
+    for i, probs_matrix in enumerate(predicted_reward_probs_record):
         plt.figure(figsize=(8, 6))
-        plt.plot(new_reward_grid, interpolated_logits)
+
+        # Plot each row in the probability matrix as a separate line
+        for row_idx, row_probs in enumerate(probs_matrix):
+            # Interpolate to fit the new grid size
+            interpolation_function = interp1d(reward_grid, row_probs, kind='linear', fill_value="extrapolate")
+            interpolated_probs = interpolation_function(new_reward_grid)
+
+            # Normalize interpolated logits to ensure they sum to 1 (convert to probability)
+            interpolated_probs /= interpolated_probs.sum()
+
+            # Plot each row with a different color
+            plt.plot(new_reward_grid, interpolated_probs, label=f"value token No.{row_idx + 1}")
+
         plt.xlabel("Reward")
         plt.ylabel("Probability")
-        plt.title(f"Predicted Reward PDF at Step {step}, Logits Set {i+1}")
+        plt.title(f"Predicted Reward PDF at Step {step}, Matrix {i+1}")
         plt.grid(True)
-        
-        # Save each plot locally with unique identifier for each logit set
-        save_path = os.path.join(save_dir, f"{config.name}_reward_pdf_step_{step}_set_{i+1}.png")
+        plt.legend()
+
+        # Save each plot locally with a unique identifier for each matrix in the record
+        save_path = os.path.join(save_dir, f"{config.name}_reward_pdf_step_{step}_matrix_{i+1}.png")
         plt.savefig(save_path)
         plt.close()
         
-        print(f"Saved PDF plot for logits set {i+1} at step {step} to {save_path}")
+        print(f"Saved PDF plot for matrix {i+1} at step {step} to {save_path}")
         
 # Training and evaluation logic
 @torch.no_grad()
@@ -425,7 +430,7 @@ def eval_rollout(
 
     # cannot step higher than model episode len, as timestep embeddings will crash
     episode_return, episode_len = 0.0, 0.0
-    reward_logits_record = []
+    predicted_reward_probs_record = []
     for step in range(model.episode_len):
         # first select history up to step, then select last seq_len states,
         # step + 1 as : operator is not inclusive, last action is dummy with zeros
@@ -436,9 +441,13 @@ def eval_rollout(
             returns[:, : step + 1][:, -model.seq_len :],
             time_steps[:, : step + 1][:, -model.seq_len :],
         )
-        predicted_reward_probs = F.softmax(predicted_returns[0, -1], dim=-1)
-        predicted_reward = (predicted_reward_probs * reward_grid).sum()
-        reward_logits_record.append(predicted_reward_probs.cpu().numpy())  # Record logits
+        # Compute probabilities for each row in predicted_returns[0]
+        predicted_reward_probs = F.softmax(predicted_returns[0], dim=-1)
+        # Record the entire probability matrix for this timestep
+        predicted_reward_probs_record.append(predicted_reward_probs.cpu().numpy())
+
+        # Calculate expected reward by averaging across the grid with probabilities
+        predicted_reward = (predicted_reward_probs * reward_grid).sum(dim=-1)
         
         predicted_action = predicted_actions[0, -1].cpu().numpy()
         next_state, reward, done, info = env.step(predicted_action)
@@ -448,8 +457,7 @@ def eval_rollout(
 
         # Origin DT:
         # returns[:, step + 1] = torch.as_tensor(returns[:, step] - reward)
-
-        returns[:, step] = predicted_reward
+        returns[:, step] = predicted_reward[-1]
 
         episode_return += reward
         episode_len += 1
@@ -457,7 +465,7 @@ def eval_rollout(
         if done:
             break
 
-    return episode_return, episode_len, reward_logits_record
+    return episode_return, episode_len, predicted_reward_probs_record
 
 
 @pyrallis.wrap()
@@ -568,10 +576,10 @@ def train(config: TrainConfig):
             for target_return in config.target_returns:
                 eval_env.seed(config.eval_seed)
                 eval_returns = []
-                reward_logits_accum = []  # Reset for each evaluation
+                predicted_reward_probs_record_accum = []  # Reset for each evaluation
 
                 for _ in trange(config.eval_episodes, desc="Evaluation", leave=False):
-                    eval_return, eval_len, reward_logits = eval_rollout(
+                    eval_return, eval_len, predicted_reward_probs_record = eval_rollout(
                         model=model,
                         env=eval_env,
                         target_return=target_return * config.reward_scale,
@@ -580,16 +588,16 @@ def train(config: TrainConfig):
                     )
                     # unscale for logging & correct normalized score computation
                     eval_returns.append(eval_return / config.reward_scale)
-                    reward_logits_accum.extend(reward_logits)  # Store all logits
+                    predicted_reward_probs_record_accum.extend(predicted_reward_probs_record)  # Store all logits
 
                 # Draw a random sample of 10 logits or fewer if less than 10 available
-                if len(reward_logits_accum) > 20:
-                    sampled_logits = random.sample(reward_logits_accum, 20)
+                if len(predicted_reward_probs_record_accum) > 5:
+                    sampled_predicted_reward_probs = random.sample(predicted_reward_probs_record_accum, 5)
                 else:
-                    sampled_logits = reward_logits_accum
+                    sampled_predicted_reward_probs = predicted_reward_probs_record_accum
 
                 # Plot the PDF using the sampled logits
-                plot_pdf(sampled_logits, reward_grid.cpu().numpy(), step, config=config)
+                plot_pdf(sampled_predicted_reward_probs, reward_grid.cpu().numpy(), step, config=config)
 
                 normalized_scores = (
                     eval_env.get_normalized_score(np.array(eval_returns)) * 100
