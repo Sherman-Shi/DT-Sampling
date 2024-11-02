@@ -3,6 +3,7 @@ runs/
 logs/
 Uncertainty_Exploration/pdf_plots/
 Uncertainty_Exploration/td_plots/
+Uncertainty_Exploration/head_plots/
 
 *.pyc
 *.log

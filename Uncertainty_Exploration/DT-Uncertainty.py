@@ -25,12 +25,13 @@ import matplotlib.pyplot as plt
 class TrainConfig:
     # wandb params
     project: str = "DT_Uncertainty_Exploration"
-    group: str = "DT-U-D4RL-dev"
+    group: str = "DT-U-D4RL-head-dev"
     name: str = "DT-U-dev"
     # model params
     embedding_dim: int = 256
     num_layers: int = 5
     num_heads: int = 1
+    num_reward_heads: int = 8
     seq_len: int = 10
     episode_len: int = 1000
     attention_dropout: float = 0.1
@@ -268,6 +269,7 @@ class DecisionTransformer(nn.Module):
         embedding_dim: int = 128,
         num_layers: int = 4,
         num_heads: int = 8,
+        num_reward_heads: int = 10, 
         attention_dropout: float = 0.0,
         residual_dropout: float = 0.0,
         embedding_dropout: float = 0.0,
@@ -297,7 +299,9 @@ class DecisionTransformer(nn.Module):
             ]
         )
         self.action_head = nn.Sequential(nn.Linear(embedding_dim, action_dim), nn.Tanh())
-        self.reward_head = nn.Sequential(nn.Linear(embedding_dim, reward_grid_size), nn.Tanh())
+        # reward ensemble 
+        self.reward_heads = nn.ModuleList([nn.Sequential(nn.Linear(embedding_dim, reward_grid_size), nn.Tanh()) for _ in range(num_reward_heads)])
+
         self.seq_len = seq_len
         self.embedding_dim = embedding_dim
         self.state_dim = state_dim
@@ -364,8 +368,10 @@ class DecisionTransformer(nn.Module):
         action_out = self.action_head(returns_emb_out) * self.max_action
 
         # Predict rewards from reward embeddings
-        returns_out = self.reward_head(state_emb_out)  # Define this head in the
-        return action_out, returns_out
+        # TODO: predict an ensemble of reward distributions 
+        # each one with one head of attention 
+        reward_out_ensemble = [head(state_emb_out) for head in self.reward_heads]
+        return action_out, reward_out_ensemble
 
 
 def compute_epistemic_uncertainty(ensemble: np.ndarray, reward_grid: np.ndarray) -> float:
@@ -463,12 +469,12 @@ def compute_td_ensemble(
     
     return ensembles
 
-def plot_multiple_td_ensembles(
+def plot_multiple_ensembles(
     ensembles: List[np.ndarray], 
     reward_grid: np.ndarray, 
     step: int, 
     config: TrainConfig, 
-    save_dir: str = "td_plots",
+    save_dir: str = "head_plots",
     num_grid: int = 200  # New parameter for re-gridding
 ) -> None:
     """
@@ -498,21 +504,21 @@ def plot_multiple_td_ensembles(
         for j, distribution in enumerate(ensemble):
             # Interpolate distribution to match the new grid
             interpolated_distribution = np.interp(new_reward_grid, reward_grid, distribution)
-            plt.plot(new_reward_grid, interpolated_distribution, label=f"Shifted Step {j+1}")
+            plt.plot(new_reward_grid, interpolated_distribution, label=f"Predict No. {j+1}")
 
         plt.xlabel("Reward")
         plt.ylabel("Probability")
-        plt.title(f"Predicted Value Distributions by DT (Training Step {step}, No.{i+1})\n"
+        plt.title(f"Predicted Value Distributions by DT (Training Step {step}, Sample No.{i+1})\n"
                   f"Epistemic Uncertainty (σ²_epi): {(epistemic_uncertainty * 10000):.4f}")
         plt.legend(loc="upper right")
         plt.grid(True)
 
         # Save each plot with a unique identifier for each ensemble
-        save_path = os.path.join(save_dir, f"{config.name}_td_shift_ensemble_{i+1}_step_{step}.png")
+        save_path = os.path.join(save_dir, f"{config.name}_ensemble_{i+1}_step_{step}.png")
         plt.savefig(save_path, bbox_inches="tight")
         plt.close()
         
-        print(f"Saved TD-shifted ensemble plot {i+1} for step {step} to {save_path}")
+        print(f"Saved ensemble plot {i+1} for step {step} to {save_path}")
 
 # Training and evaluation logic
 @torch.no_grad()
@@ -541,28 +547,37 @@ def eval_rollout(
 
     # cannot step higher than model episode len, as timestep embeddings will crash
     episode_return, episode_len = 0.0, 0.0
-    reward_probs_and_rewards = []  # To store (last value distribution, instant reward) pairs
+    predicted_reward_probs_ensemble = []  # Store ensemble of predicted reward distributions    
+
     for step in range(model.episode_len):
         # first select history up to step, then select last seq_len states,
         # step + 1 as : operator is not inclusive, last action is dummy with zeros
         # (as model will predict last, actual last values are not important)
-        predicted_actions, predicted_returns = model(  # fix this noqa!!!
+        predicted_actions, reward_logits_ensemble = model(  # fix this noqa!!!
             states[:, : step + 1][:, -model.seq_len :],
             actions[:, : step + 1][:, -model.seq_len :],
             returns[:, : step + 1][:, -model.seq_len :],
             time_steps[:, : step + 1][:, -model.seq_len :],
         )
+        # TODO: 
+        # input: predicted_returns which is an ensemble of value logits
         # Compute the probability distribution for the last value in the sequence
-        last_predicted_reward_probs = F.softmax(predicted_returns[0, -1], dim=-1).cpu().numpy()
+        # output: an ensemble of probabilities 
+        # Convert each logits output in the ensemble to a probability distribution
+        predicted_reward_probs = [
+            F.softmax(logits[0, -1], dim=-1).cpu().numpy() for logits in reward_logits_ensemble
+        ]
+        predicted_reward_probs_ensemble.append(predicted_reward_probs)
 
         # Perform the environment step with the predicted action
         predicted_action = predicted_actions[0, -1].cpu().numpy()
         next_state, instant_reward, done, info = env.step(predicted_action)
-        # Compute predicted reward and update returns
-        predicted_reward = (last_predicted_reward_probs * reward_grid.cpu().numpy()).sum()
-
-        # Append the last value distribution and the instant reward
-        reward_probs_and_rewards.append((last_predicted_reward_probs, instant_reward))
+        # TODO: Compute predicted reward and update returns
+        # which is a mean of the ensemble predicted rewrads times the grid 
+        # Calculate the predicted reward as the mean of the ensemble predictions
+        predicted_reward = np.mean(
+            [(probs * reward_grid.cpu().numpy()).sum() for probs in predicted_reward_probs]
+        )
 
         # at step t, we predict a_t, get s_{t + 1}, r_{t + 1}
         actions[:, step] = torch.as_tensor(predicted_action)
@@ -579,7 +594,7 @@ def eval_rollout(
         if done:
             break
 
-    return episode_return, episode_len, reward_probs_and_rewards
+    return episode_return, episode_len, predicted_reward_probs_ensemble
 
 
 @pyrallis.wrap()
@@ -619,6 +634,7 @@ def train(config: TrainConfig):
         episode_len=config.episode_len,
         num_layers=config.num_layers,
         num_heads=config.num_heads,
+        num_reward_heads = config.num_reward_heads,
         attention_dropout=config.attention_dropout,
         residual_dropout=config.residual_dropout,
         embedding_dropout=config.embedding_dropout,
@@ -650,7 +666,7 @@ def train(config: TrainConfig):
         # True value indicates that the corresponding key value will be ignored
         padding_mask = ~mask.to(torch.bool)
 
-        predicted_actions, reward_logits = model(
+        predicted_actions, reward_logits_ensemble = model(
             states=states,
             actions=actions,
             returns_to_go=returns,
@@ -660,9 +676,11 @@ def train(config: TrainConfig):
 
         # [batch_size, seq_len, action_dim] * [batch_size, seq_len, 1]
         action_loss = (F.mse_loss(predicted_actions, actions.detach(), reduction="none") * mask.unsqueeze(-1)).mean()
+        # Randomly select one reward distribution from the ensemble for loss computation
+        selected_head = random.choice(reward_logits_ensemble)
         reward_targets = torch.bucketize(returns, reward_grid).view(-1)
-        reward_logits = reward_logits.view(-1, config.reward_grid_size)
-        reward_loss = F.cross_entropy(reward_logits, reward_targets).mean()
+        selected_head = selected_head.view(-1, config.reward_grid_size)
+        reward_loss = F.cross_entropy(selected_head, reward_targets).mean()
         loss = action_loss + config.reward_loss_weight * reward_loss
 
 
@@ -694,24 +712,31 @@ def train(config: TrainConfig):
                 epistemic_uncertainties = []  # To log epistemic uncertainty per ensemble
 
                 for _ in trange(config.eval_episodes, desc="Evaluation", leave=False):
-                    eval_return, eval_len, reward_probs_and_rewards = eval_rollout(
+                    eval_return, eval_len, predicted_reward_probs_ensemble = eval_rollout(
                         model=model,
                         env=eval_env,
                         target_return=target_return * config.reward_scale,
                         config=config,
                         device=config.device,
                     )
-                    # Create TD ensemble and calculate epistemic uncertainty
-                    ensemble = compute_td_ensemble(reward_probs_and_rewards, reward_grid)
-                    epistemic_uncertainty = compute_epistemic_uncertainty(ensemble, reward_grid.cpu().numpy())
-                    global_ensembles.extend(ensemble)  # Store each ensemble separately
-                    epistemic_uncertainties.append(epistemic_uncertainty)  # Store uncertainty
+                    # TODO: compute the epistemic uncertainty of the predicted reward ensembles 
+                    # TODO: 
+                    # Compute epistemic uncertainty for each ensemble of predicted reward distributions
+                    for reward_probs in predicted_reward_probs_ensemble:
+                        epistemic_uncertainty = compute_epistemic_uncertainty(
+                            reward_probs, reward_grid.cpu().numpy()
+                        )
+                        epistemic_uncertainties.append(epistemic_uncertainty)
+                        global_ensembles.append(np.array(reward_probs))  # Store each ensemble as array
 
                     # Accumulate returns for this evaluation
                     eval_returns.append(eval_return / config.reward_scale)
 
-                # Plot all accumulated ensembles with individual epistemic uncertainties
-                plot_multiple_td_ensembles(global_ensembles, reward_grid.cpu().numpy(), step=step, config=config)
+                # Select a random sample of 10 ensembles to plot
+                sampled_ensembles = random.sample(global_ensembles, min(10, len(global_ensembles)))
+
+                # Plot the sampled ensembles with individual epistemic uncertainties
+                plot_multiple_ensembles(sampled_ensembles, reward_grid.cpu().numpy(), step=step, config=config)
 
                 # Compute normalized scores and log evaluation results
                 normalized_scores = eval_env.get_normalized_score(np.array(eval_returns)) * 100
