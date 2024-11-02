@@ -2,6 +2,7 @@ wandb/
 runs/
 logs/
 Uncertainty_Exploration/pdf_plots/
+Uncertainty_Exploration/td_plots/
 
 *.pyc
 *.log

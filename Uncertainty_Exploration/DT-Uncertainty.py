@@ -59,8 +59,8 @@ class TrainConfig:
     # general params
     checkpoints_path: Optional[str] = None
     deterministic_torch: bool = False
-    train_seed: int = 20
-    eval_seed: int = 52
+    train_seed: int = 24
+    eval_seed: int = 56
     device: str = "cuda"
 
     def __post_init__(self):
@@ -368,74 +368,152 @@ class DecisionTransformer(nn.Module):
         return action_out, returns_out
 
 
-def compute_epistemic_uncertainty(probs_matrix: np.ndarray, reward_grid: np.ndarray) -> float:
+def compute_epistemic_uncertainty(ensemble: np.ndarray, reward_grid: np.ndarray) -> float:
     """
-    Computes the epistemic uncertainty (σ²_epi) for an ensemble of probability distributions.
+    Compute the epistemic uncertainty (σ²_epi) for the ensemble of distributions.
     
     Parameters:
-    - probs_matrix (np.ndarray): Array of shape (M, N) where M is the number of models (ensembles)
-                                 and N is the number of reward grid points, representing each model's
-                                 probability distribution over the reward grid.
-    - reward_grid (np.ndarray): Array of shape (N,) representing the reward grid values.
-
-    Returns:
-    - float: The epistemic uncertainty (σ²_epi).
-    """
-    M, N = probs_matrix.shape
+    - ensemble (np.ndarray): Stacked ensemble of distributions, shape (ensemble_size, reward_grid_size).
+    - reward_grid (np.ndarray): The reward grid, shape (reward_grid_size,).
     
+    Returns:
+    - float: The computed epistemic uncertainty.
+    """
+    ensemble = np.array(ensemble)
     # Step 1: Compute the ensemble mean distribution p(v_t | s_t)
-    mean_probs = np.mean(probs_matrix, axis=0)
+    mean_probs = np.mean(ensemble, axis=0)
     
     # Step 2: Compute the expected value of v_t for the mean distribution
     ensemble_mean_value = np.sum(mean_probs * reward_grid)
     
     # Step 3: Compute the expected value of v_t for each model's distribution
-    individual_expected_values = np.sum(probs_matrix * reward_grid, axis=1)
+    individual_expected_values = np.sum(ensemble * reward_grid, axis=1)
     
     # Step 4: Calculate the epistemic uncertainty as variance of the model predictions around the mean
-    epistemic_uncertainty = (1 / M) * np.sum((individual_expected_values - ensemble_mean_value) ** 2)
+    epistemic_uncertainty = (1 / ensemble.shape[0]) * np.sum((individual_expected_values - ensemble_mean_value) ** 2)
     
     return epistemic_uncertainty
 
-def plot_pdf(predicted_reward_probs_record, reward_grid, step, config, num_grids=100, save_dir="pdf_plots"):
-    # Ensure the save directory exists
-    os.makedirs(save_dir, exist_ok=True)
-
-    # Define a new grid of 100 points across the range of the original reward grid
-    new_reward_grid = np.linspace(reward_grid.min(), reward_grid.max(), num_grids)
+def temporal_difference_shift(distribution: np.ndarray, reward: float, reward_grid: np.ndarray) -> np.ndarray:
+    """
+    Shift the value distribution back by a reward using Temporal Difference (TD).
     
-    for i, probs_matrix in enumerate(predicted_reward_probs_record):
-        # Compute epistemic uncertainty for the current matrix
-        epistemic_uncertainty = compute_epistemic_uncertainty(probs_matrix, reward_grid)
+    Parameters:
+    - distribution (np.ndarray): The original distribution to shift, shape (reward_grid_size,).
+    - reward (float): The reward by which to shift the distribution.
+    - reward_grid (np.ndarray): The reward grid, shape (reward_grid_size,).
+    
+    Returns:
+    - np.ndarray: The shifted distribution, normalized to sum to 1.
+    """
+    shifted_grid = reward_grid - reward  # Shift grid by the reward
+    shifted_distribution = np.zeros_like(distribution)
 
-        plt.figure(figsize=(8, 6))
+    # Interpolate the distribution to fit back to the original grid with shifting
+    interpolation_function = interp1d(shifted_grid.cpu().numpy(), distribution, kind='linear', bounds_error=False, fill_value=0.0)
+    shifted_distribution = interpolation_function(reward_grid.cpu().numpy())
 
-        # Plot each row in the probability matrix as a separate line
-        for row_idx, row_probs in enumerate(probs_matrix):
-            # Interpolate to fit the new grid size
-            interpolation_function = interp1d(reward_grid, row_probs, kind='linear', fill_value="extrapolate")
-            interpolated_probs = interpolation_function(new_reward_grid)
+    return shifted_distribution / shifted_distribution.sum()  # Normalize
 
-            # Normalize interpolated logits to ensure they sum to 1 (convert to probability)
-            interpolated_probs /= interpolated_probs.sum()
+def compute_td_ensemble(
+    reward_probs_and_rewards: List[Tuple[np.ndarray, float]], 
+    reward_grid: np.ndarray, 
+    num_distributions: int = 7, 
+    num_ensembles: int = 3
+) -> List[np.ndarray]:
+    """
+    Create multiple ensembles of distributions based on Temporal Difference (TD) shifts.
+    Each ensemble starts at a different randomly selected base distribution (or uses as many as available if fewer) 
+    and shifts subsequent distributions back using cumulative rewards.
+    
+    Parameters:
+    - reward_probs_and_rewards (List[Tuple[np.ndarray, float]]): List of tuples with each tuple containing a distribution (np.ndarray) and a reward (float).
+    - reward_grid (np.ndarray): The reward grid, shape (reward_grid_size,).
+    - num_distributions (int): Number of distributions to use for each ensemble, default is 7.
+    - num_ensembles (int): Number of random ensembles to generate, default is 3.
+    
+    Returns:
+    - List[np.ndarray]: A list of stacked ensembles, each of shape (min(num_distributions, available_distributions), reward_grid_size).
+    """
+    ensembles = []
+    available_distributions = len(reward_probs_and_rewards)
 
-            # Plot each row with a different color
-            plt.plot(new_reward_grid, interpolated_probs, label=f"value token No.{row_idx + 1}")
+    for _ in range(num_ensembles):
+        # Adjust num_distributions if fewer are available
+        if available_distributions < num_distributions:
+            selected_distributions = reward_probs_and_rewards
+        else:
+            max_start_idx = available_distributions - num_distributions
+            start_idx = np.random.randint(0, max_start_idx + 1) if max_start_idx > 0 else 0
+            selected_distributions = reward_probs_and_rewards[start_idx : start_idx + num_distributions]
+
+        # Initialize the ensemble with the base distribution
+        base_distribution, _ = selected_distributions[0]
+        ensemble = [base_distribution]
+        
+        cumulative_reward = 0.0
+        
+        # Shift each subsequent distribution back using cumulative rewards
+        for k in range(1, len(selected_distributions)):
+            cumulative_reward += selected_distributions[k - 1][1]
+            shifted_dist = temporal_difference_shift(selected_distributions[k][0], cumulative_reward, reward_grid)
+            ensemble.append(shifted_dist)
+        
+        ensembles.append(np.stack(ensemble, axis=0))
+    
+    return ensembles
+
+def plot_multiple_td_ensembles(
+    ensembles: List[np.ndarray], 
+    reward_grid: np.ndarray, 
+    step: int, 
+    config: TrainConfig, 
+    save_dir: str = "td_plots",
+    num_grid: int = 200  # New parameter for re-gridding
+) -> None:
+    """
+    Plot each Temporal Difference (TD) shifted ensemble separately with its epistemic uncertainty.
+    
+    Parameters:
+    - ensembles (List[np.ndarray]): List of stacked ensembles of distributions, each shape (ensemble_size, reward_grid_size).
+    - reward_grid (np.ndarray): The reward grid, shape (reward_grid_size,).
+    - step (int): The training step for labeling the plot.
+    - config (TrainConfig): The training configuration with details for naming and saving.
+    - save_dir (str): Directory where the plots will be saved, default is "td_plots".
+    - num_grid (int): Number of points for the re-gridded reward grid, default is 200.
+    """
+    save_dir = os.path.join(".", save_dir)
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Re-grid reward_grid to have num_grid points
+    new_reward_grid = np.linspace(reward_grid.min(), reward_grid.max(), num_grid)
+
+    for i, ensemble in enumerate(ensembles):
+        # Compute epistemic uncertainty for the current ensemble
+        epistemic_uncertainty = compute_epistemic_uncertainty(ensemble, reward_grid)
+        
+        plt.figure(figsize=(10, 7))
+        
+        # Plot each distribution in the ensemble with a different color
+        for j, distribution in enumerate(ensemble):
+            # Interpolate distribution to match the new grid
+            interpolated_distribution = np.interp(new_reward_grid, reward_grid, distribution)
+            plt.plot(new_reward_grid, interpolated_distribution, label=f"Shifted Step {j+1}")
 
         plt.xlabel("Reward")
         plt.ylabel("Probability")
-        plt.title(f"Predicted Value Distribution at Training Step {step} (Sample No. {i+1})\n"
-                  f"Epistemic Uncertainty (σ²_epi): {(epistemic_uncertainty*10000):.4f}")
+        plt.title(f"Predicted Value Distributions by DT (Training Step {step}, No.{i+1})\n"
+                  f"Epistemic Uncertainty (σ²_epi): {(epistemic_uncertainty * 10000):.4f}")
+        plt.legend(loc="upper right")
         plt.grid(True)
-        plt.legend()
 
-        # Save each plot locally with a unique identifier for each matrix in the record
-        save_path = os.path.join(save_dir, f"{config.name}_reward_pdf_step_{step}_matrix_{i+1}.png")
-        plt.savefig(save_path)
+        # Save each plot with a unique identifier for each ensemble
+        save_path = os.path.join(save_dir, f"{config.name}_td_shift_ensemble_{i+1}_step_{step}.png")
+        plt.savefig(save_path, bbox_inches="tight")
         plt.close()
         
-        print(f"Saved PDF plot for matrix {i+1} at step {step} to {save_path}")
-        
+        print(f"Saved TD-shifted ensemble plot {i+1} for step {step} to {save_path}")
+
 # Training and evaluation logic
 @torch.no_grad()
 def eval_rollout(
@@ -463,7 +541,7 @@ def eval_rollout(
 
     # cannot step higher than model episode len, as timestep embeddings will crash
     episode_return, episode_len = 0.0, 0.0
-    predicted_reward_probs_record = []
+    reward_probs_and_rewards = []  # To store (last value distribution, instant reward) pairs
     for step in range(model.episode_len):
         # first select history up to step, then select last seq_len states,
         # step + 1 as : operator is not inclusive, last action is dummy with zeros
@@ -474,31 +552,34 @@ def eval_rollout(
             returns[:, : step + 1][:, -model.seq_len :],
             time_steps[:, : step + 1][:, -model.seq_len :],
         )
-        # Compute probabilities for each row in predicted_returns[0]
-        predicted_reward_probs = F.softmax(predicted_returns[0], dim=-1)
-        # Record the entire probability matrix for this timestep
-        predicted_reward_probs_record.append(predicted_reward_probs.cpu().numpy())
+        # Compute the probability distribution for the last value in the sequence
+        last_predicted_reward_probs = F.softmax(predicted_returns[0, -1], dim=-1).cpu().numpy()
 
-        # Calculate expected reward by averaging across the grid with probabilities
-        predicted_reward = (predicted_reward_probs * reward_grid).sum(dim=-1)
-        
+        # Perform the environment step with the predicted action
         predicted_action = predicted_actions[0, -1].cpu().numpy()
-        next_state, reward, done, info = env.step(predicted_action)
+        next_state, instant_reward, done, info = env.step(predicted_action)
+        # Compute predicted reward and update returns
+        predicted_reward = (last_predicted_reward_probs * reward_grid.cpu().numpy()).sum()
+
+        # Append the last value distribution and the instant reward
+        reward_probs_and_rewards.append((last_predicted_reward_probs, instant_reward))
+
         # at step t, we predict a_t, get s_{t + 1}, r_{t + 1}
         actions[:, step] = torch.as_tensor(predicted_action)
         states[:, step + 1] = torch.as_tensor(next_state)
 
         # Origin DT:
         # returns[:, step + 1] = torch.as_tensor(returns[:, step] - reward)
-        returns[:, step] = predicted_reward[-1]
+        returns[:, step] = torch.tensor(predicted_reward, dtype=torch.float32, device=device)
 
-        episode_return += reward
+
+        episode_return += instant_reward
         episode_len += 1
 
         if done:
             break
 
-    return episode_return, episode_len, predicted_reward_probs_record
+    return episode_return, episode_len, reward_probs_and_rewards
 
 
 @pyrallis.wrap()
@@ -609,42 +690,39 @@ def train(config: TrainConfig):
             for target_return in config.target_returns:
                 eval_env.seed(config.eval_seed)
                 eval_returns = []
-                predicted_reward_probs_record_accum = []  # Reset for each evaluation
+                global_ensembles = []  # To store each episode's ensemble separately
+                epistemic_uncertainties = []  # To log epistemic uncertainty per ensemble
 
                 for _ in trange(config.eval_episodes, desc="Evaluation", leave=False):
-                    eval_return, eval_len, predicted_reward_probs_record = eval_rollout(
+                    eval_return, eval_len, reward_probs_and_rewards = eval_rollout(
                         model=model,
                         env=eval_env,
                         target_return=target_return * config.reward_scale,
                         config=config,
                         device=config.device,
                     )
-                    # unscale for logging & correct normalized score computation
+                    # Create TD ensemble and calculate epistemic uncertainty
+                    ensemble = compute_td_ensemble(reward_probs_and_rewards, reward_grid)
+                    epistemic_uncertainty = compute_epistemic_uncertainty(ensemble, reward_grid.cpu().numpy())
+                    global_ensembles.extend(ensemble)  # Store each ensemble separately
+                    epistemic_uncertainties.append(epistemic_uncertainty)  # Store uncertainty
+
+                    # Accumulate returns for this evaluation
                     eval_returns.append(eval_return / config.reward_scale)
-                    predicted_reward_probs_record_accum.extend(predicted_reward_probs_record)  # Store all logits
 
-                # Draw a random sample of 10 logits or fewer if less than 10 available
-                if len(predicted_reward_probs_record_accum) > 5:
-                    sampled_predicted_reward_probs = random.sample(predicted_reward_probs_record_accum, 5)
-                else:
-                    sampled_predicted_reward_probs = predicted_reward_probs_record_accum
+                # Plot all accumulated ensembles with individual epistemic uncertainties
+                plot_multiple_td_ensembles(global_ensembles, reward_grid.cpu().numpy(), step=step, config=config)
 
-                # Plot the PDF using the sampled logits
-                plot_pdf(sampled_predicted_reward_probs, reward_grid.cpu().numpy(), step, config=config)
-
-                normalized_scores = (
-                    eval_env.get_normalized_score(np.array(eval_returns)) * 100
-                )
+                # Compute normalized scores and log evaluation results
+                normalized_scores = eval_env.get_normalized_score(np.array(eval_returns)) * 100
                 wandb.log(
                     {
                         f"eval/{target_return}_return_mean": np.mean(eval_returns),
                         f"eval/{target_return}_return_std": np.std(eval_returns),
-                        f"eval/{target_return}_normalized_score_mean": np.mean(
-                            normalized_scores
-                        ),
-                        f"eval/{target_return}_normalized_score_std": np.std(
-                            normalized_scores
-                        ),
+                        f"eval/{target_return}_normalized_score_mean": np.mean(normalized_scores),
+                        f"eval/{target_return}_normalized_score_std": np.std(normalized_scores),
+                        f"eval/epistemic_uncertainty_mean": np.mean(epistemic_uncertainties),
+                        f"eval/epistemic_uncertainty_std": np.std(epistemic_uncertainties),
                     },
                     step=step,
                 )
