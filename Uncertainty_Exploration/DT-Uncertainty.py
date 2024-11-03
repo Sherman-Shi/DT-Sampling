@@ -62,7 +62,7 @@ class TrainConfig:
     deterministic_torch: bool = False
     train_seed: int = 24
     eval_seed: int = 56
-    device: str = "cuda"
+    device: str = "cuda:0"
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
@@ -489,6 +489,7 @@ def plot_multiple_ensembles(
     - num_grid (int): Number of points for the re-gridded reward grid, default is 200.
     """
     save_dir = os.path.join(".", save_dir)
+    save_dir = os.path.join(save_dir, config.name)
     os.makedirs(save_dir, exist_ok=True)
     
     # Re-grid reward_grid to have num_grid points
