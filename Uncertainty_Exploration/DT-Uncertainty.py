@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 class TrainConfig:
     # wandb params
     project: str = "DT_Uncertainty_Exploration"
-    group: str = "DT-U-D4RL-head-dev"
+    group: str = "DT-U-D4RL-head-threshold_target-dev"
     name: str = "DT-U-dev"
     # model params
     embedding_dim: int = 256
@@ -53,6 +53,7 @@ class TrainConfig:
     min_reward: float = 0.0    # Define the minimum possible reward
     max_reward: float = 15.0     # Define the maximum possible reward
     reward_loss_weight: float = 0.1
+    target_value_prob_threshold: float = 0.95 
     # evaluation params
     target_returns: Tuple[float, ...] = (12000.0, 6000.0)
     eval_episodes: int = 10
@@ -505,11 +506,18 @@ def eval_rollout(
         predicted_action = predicted_actions[0, -1].cpu().numpy()
         next_state, instant_reward, done, info = env.step(predicted_action)
         # TODO: Compute predicted reward and update returns
-        # which is a mean of the ensemble predicted rewrads times the grid 
         # Calculate the predicted reward as the mean of the ensemble predictions
-        predicted_reward = np.mean(
-            [(probs * reward_grid.cpu().numpy()).sum() for probs in predicted_reward_probs]
-        )
+        # Now calculate the cumulative distribution for the ensemble
+        avg_reward_probs = np.mean(predicted_reward_probs, axis=0)
+        cumulative_probs = np.cumsum(avg_reward_probs)
+        
+        # Find the first grid point where the cumulative probability meets or exceeds the threshold
+        threshold_index = np.searchsorted(cumulative_probs, config.target_value_prob_threshold)
+        
+        # Ensure we don't go out of bounds
+        threshold_index = min(threshold_index, len(reward_grid) - 1)
+        predicted_reward = reward_grid[threshold_index].item()
+
 
         # at step t, we predict a_t, get s_{t + 1}, r_{t + 1}
         actions[:, step] = torch.as_tensor(predicted_action)
