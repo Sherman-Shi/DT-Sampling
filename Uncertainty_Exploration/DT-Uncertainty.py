@@ -361,8 +361,7 @@ class DecisionTransformer(nn.Module):
         # [batch_size, seq_len, action_dim]
         # Extract state, action, and reward embeddings from the sequence
         state_emb_out = out[:, 0::3]  # State embeddings
-        returns_emb_out = out[:, 1::3]  # Action embeddings
-        # returns_emb_out = out[:, 2::3]  # Reward embeddings
+        returns_emb_out = out[:, 1::3]  # Reward embeddings
 
         # Predict actions from action embeddings
         action_out = self.action_head(returns_emb_out) * self.max_action
@@ -400,74 +399,6 @@ def compute_epistemic_uncertainty(ensemble: np.ndarray, reward_grid: np.ndarray)
     
     return epistemic_uncertainty
 
-def temporal_difference_shift(distribution: np.ndarray, reward: float, reward_grid: np.ndarray) -> np.ndarray:
-    """
-    Shift the value distribution back by a reward using Temporal Difference (TD).
-    
-    Parameters:
-    - distribution (np.ndarray): The original distribution to shift, shape (reward_grid_size,).
-    - reward (float): The reward by which to shift the distribution.
-    - reward_grid (np.ndarray): The reward grid, shape (reward_grid_size,).
-    
-    Returns:
-    - np.ndarray: The shifted distribution, normalized to sum to 1.
-    """
-    shifted_grid = reward_grid - reward  # Shift grid by the reward
-    shifted_distribution = np.zeros_like(distribution)
-
-    # Interpolate the distribution to fit back to the original grid with shifting
-    interpolation_function = interp1d(shifted_grid.cpu().numpy(), distribution, kind='linear', bounds_error=False, fill_value=0.0)
-    shifted_distribution = interpolation_function(reward_grid.cpu().numpy())
-
-    return shifted_distribution / shifted_distribution.sum()  # Normalize
-
-def compute_td_ensemble(
-    reward_probs_and_rewards: List[Tuple[np.ndarray, float]], 
-    reward_grid: np.ndarray, 
-    num_distributions: int = 7, 
-    num_ensembles: int = 3
-) -> List[np.ndarray]:
-    """
-    Create multiple ensembles of distributions based on Temporal Difference (TD) shifts.
-    Each ensemble starts at a different randomly selected base distribution (or uses as many as available if fewer) 
-    and shifts subsequent distributions back using cumulative rewards.
-    
-    Parameters:
-    - reward_probs_and_rewards (List[Tuple[np.ndarray, float]]): List of tuples with each tuple containing a distribution (np.ndarray) and a reward (float).
-    - reward_grid (np.ndarray): The reward grid, shape (reward_grid_size,).
-    - num_distributions (int): Number of distributions to use for each ensemble, default is 7.
-    - num_ensembles (int): Number of random ensembles to generate, default is 3.
-    
-    Returns:
-    - List[np.ndarray]: A list of stacked ensembles, each of shape (min(num_distributions, available_distributions), reward_grid_size).
-    """
-    ensembles = []
-    available_distributions = len(reward_probs_and_rewards)
-
-    for _ in range(num_ensembles):
-        # Adjust num_distributions if fewer are available
-        if available_distributions < num_distributions:
-            selected_distributions = reward_probs_and_rewards
-        else:
-            max_start_idx = available_distributions - num_distributions
-            start_idx = np.random.randint(0, max_start_idx + 1) if max_start_idx > 0 else 0
-            selected_distributions = reward_probs_and_rewards[start_idx : start_idx + num_distributions]
-
-        # Initialize the ensemble with the base distribution
-        base_distribution, _ = selected_distributions[0]
-        ensemble = [base_distribution]
-        
-        cumulative_reward = 0.0
-        
-        # Shift each subsequent distribution back using cumulative rewards
-        for k in range(1, len(selected_distributions)):
-            cumulative_reward += selected_distributions[k - 1][1]
-            shifted_dist = temporal_difference_shift(selected_distributions[k][0], cumulative_reward, reward_grid)
-            ensemble.append(shifted_dist)
-        
-        ensembles.append(np.stack(ensemble, axis=0))
-    
-    return ensembles
 
 def plot_multiple_ensembles(
     ensembles: List[np.ndarray], 
