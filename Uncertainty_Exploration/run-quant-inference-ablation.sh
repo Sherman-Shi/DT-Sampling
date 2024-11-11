@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # List of environments
-environments=("halfcheetah-medium-v2")
+environments=("hopper-medium-v2")
 
 # Function to generate a random seed
 generate_random_seed() {
