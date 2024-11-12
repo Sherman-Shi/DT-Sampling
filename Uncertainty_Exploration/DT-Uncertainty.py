@@ -480,7 +480,7 @@ def eval_rollout(
 
     # cannot step higher than model episode len, as timestep embeddings will crash
     episode_return, episode_len = 0.0, 0.0
-    predicted_reward_probs_ensemble = []  # Store ensemble of predicted reward distributions    
+    predicted_reward_logits_ensemble = []  # Store ensemble of predicted reward distributions    
 
     for step in range(model.episode_len):
         # first select history up to step, then select last seq_len states,
@@ -500,7 +500,8 @@ def eval_rollout(
         predicted_reward_probs = [
             F.softmax(logits[0, -1], dim=-1).cpu().numpy() for logits in reward_logits_ensemble
         ]
-        predicted_reward_probs_ensemble.append(predicted_reward_probs)
+        predicted_reward_logits = [logits[0, -1].cpu().numpy() for logits in reward_logits_ensemble]   
+        predicted_reward_logits_ensemble.append(predicted_reward_probs)
 
         # Perform the environment step with the predicted action
         predicted_action = predicted_actions[0, -1].cpu().numpy()
@@ -534,7 +535,7 @@ def eval_rollout(
         if done:
             break
 
-    return episode_return, episode_len, predicted_reward_probs_ensemble
+    return episode_return, episode_len, predicted_reward_logits_ensemble
 
 
 @pyrallis.wrap()
