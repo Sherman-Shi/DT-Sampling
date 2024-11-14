@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 class TrainConfig:
     # wandb params
     project: str = "DT_Uncertainty_Exploration"
-    group: str = "DT-U-D4RL-head-threshold_target-dev"
+    group: str = "DT-U-D4RL-online_developing_dev"
     name: str = "DT-U-dev"
     # model params
     embedding_dim: int = 256
@@ -46,7 +46,9 @@ class TrainConfig:
     clip_grad: Optional[float] = 0.25
     batch_size: int = 64
     update_steps: int = 100_000
-    warmup_steps: int = 10_000
+    warmup_steps: int = 100
+    online_freq: int = 200  # Frequency of interacting with the environment and adding a new episode
+    online_rollout_num: int = 12
     reward_scale: float = 0.001
     num_workers: int = 4
     reward_grid_size: int = 1000  # Define the number of discrete reward points in the grid
@@ -63,7 +65,7 @@ class TrainConfig:
     deterministic_torch: bool = False
     train_seed: int = 24
     eval_seed: int = 56
-    device: str = "cuda:0"
+    device: str = "cuda:1"
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
@@ -168,8 +170,9 @@ def load_d4rl_trajectories(
 
 
 class SequenceDataset(IterableDataset):
-    def __init__(self, env_name: str, seq_len: int = 10, reward_scale: float = 1.0):
-        self.dataset, info = load_d4rl_trajectories(env_name, gamma=1.0)
+    def __init__(self, env_name: str, seq_len: int = 10, reward_scale: float = 1.0, max_size=1000):
+        self.max_size = max_size
+        self.dataset, info = self.load_initial_data(env_name)  # Load initial data into the buffer
         self.reward_scale = reward_scale
         self.seq_len = seq_len
 
@@ -177,6 +180,40 @@ class SequenceDataset(IterableDataset):
         self.state_std = info["obs_std"]
         # https://github.com/kzl/decision-transformer/blob/e2d82e68f330c00f763507b3b01d774740bee53f/gym/experiment.py#L116 # noqa
         self.sample_prob = info["traj_lens"] / info["traj_lens"].sum()
+
+
+    def load_initial_data(self, env_name: str):
+        """Loads initial trajectories into the dataset buffer."""
+        initial_data, info = load_d4rl_trajectories(env_name, gamma=1.0)
+        self.state_mean = info["obs_mean"]
+        self.state_std = info["obs_std"]
+        
+        
+        # Limit the loaded data to max_size
+        self.dataset = initial_data[:self.max_size]
+        return self.dataset, info
+
+    def add_episode(self, episode_data_list: List[Dict[str, np.ndarray]]):
+        """
+        Add a list of new episodes to the dataset.
+        episode_data_list: A list of dictionaries containing 'observations', 'actions', 'rewards', and 'returns'.
+        """
+        for episode_data in episode_data_list:
+            # Scale the rewards and normalize the states for each episode
+            episode_data["rewards"] *= self.reward_scale
+            episode_data["observations"] = (episode_data["observations"] - self.state_mean) / self.state_std
+            
+            # Append the new episode to the dataset and maintain its size
+            self.dataset.append(episode_data)
+
+            # If the dataset exceeds max_size, remove the oldest episode (or any other strategy)
+            if len(self.dataset) > self.max_size:
+                self.dataset.pop(0)  # Remove the first (oldest) episode
+
+        # Recompute the sample probabilities with updated trajectory lengths
+        traj_lens = [len(traj["actions"]) for traj in self.dataset]
+        self.sample_prob = np.array(traj_lens) / np.sum(traj_lens)
+
 
     def __prepare_sample(self, traj_idx, start_idx):
         traj = self.dataset[traj_idx]
@@ -200,9 +237,11 @@ class SequenceDataset(IterableDataset):
         return states, actions, returns, time_steps, mask
 
     def __iter__(self):
-        while True:
+        while True:       
+            # Sample a trajectory index based on updated probabilities
             traj_idx = np.random.choice(len(self.dataset), p=self.sample_prob)
             start_idx = random.randint(0, self.dataset[traj_idx]["rewards"].shape[0] - 1)
+            
             yield self.__prepare_sample(traj_idx, start_idx)
 
 
@@ -480,7 +519,7 @@ def eval_rollout(
 
     # cannot step higher than model episode len, as timestep embeddings will crash
     episode_return, episode_len = 0.0, 0.0
-    predicted_reward_probs_ensemble = []  # Store ensemble of predicted reward distributions    
+    predicted_reward_logits_ensemble = []  # Store ensemble of predicted reward distributions    
 
     for step in range(model.episode_len):
         # first select history up to step, then select last seq_len states,
@@ -500,7 +539,8 @@ def eval_rollout(
         predicted_reward_probs = [
             F.softmax(logits[0, -1], dim=-1).cpu().numpy() for logits in reward_logits_ensemble
         ]
-        predicted_reward_probs_ensemble.append(predicted_reward_probs)
+        predicted_reward_logits = [logits[0, -1].cpu().numpy() for logits in reward_logits_ensemble]   
+        predicted_reward_logits_ensemble.append(predicted_reward_probs)
 
         # Perform the environment step with the predicted action
         predicted_action = predicted_actions[0, -1].cpu().numpy()
@@ -531,10 +571,132 @@ def eval_rollout(
         episode_return += instant_reward
         episode_len += 1
 
+
+
         if done:
             break
 
-    return episode_return, episode_len, predicted_reward_probs_ensemble
+
+    return episode_return, episode_len, predicted_reward_logits_ensemble
+
+@torch.no_grad()
+def interact_with_env(
+    env: gym.Env,
+    model: DecisionTransformer,
+    config: TrainConfig,
+) -> list:
+    all_episodes = []  # Store all collected episodes
+    
+    training_returns = []
+    # Loop to collect the specified number of episodes
+    for _ in range(config.online_rollout_num):
+        # Initialize episode data storage
+        device = config.device 
+        reward_grid = torch.linspace(config.min_reward, config.max_reward, config.reward_grid_size, device=config.device)
+        episode = {
+            'observations': [],
+            'actions': [],
+            'rewards': [],
+            'next_observations': [],
+            'done': [],
+        }
+
+        # Prepare necessary tensors for tracking states, actions, returns, and time_steps
+        states = torch.zeros(
+            1, model.episode_len + 1, model.state_dim, dtype=torch.float, device=device
+        )
+        actions = torch.zeros(
+            1, model.episode_len, model.action_dim, dtype=torch.float, device=device
+        )
+        returns = torch.zeros(1, model.episode_len + 1, dtype=torch.float, device=device)
+        time_steps = torch.arange(model.episode_len, dtype=torch.long, device=device)
+        time_steps = time_steps.view(1, -1)
+
+        # Reset the environment and get the initial state
+        state = env.reset()
+        states[:, 0] = torch.as_tensor(state, device=device)
+
+
+        # Initialize the episode variables
+        episode_return, episode_len = 0.0, 0.0
+        predicted_reward_logits_ensemble = []  # Store ensemble of predicted reward distributions    
+
+        for step in range(model.episode_len):
+            # Select history up to current step (limited to seq_len)
+            predicted_actions, reward_logits_ensemble = model(
+                states[:, : step + 1][:, -model.seq_len :],
+                actions[:, : step + 1][:, -model.seq_len :],
+                returns[:, : step + 1][:, -model.seq_len :],
+                time_steps[:, : step + 1][:, -model.seq_len :],
+            )
+
+            # Convert each logits output in the ensemble to a probability distribution
+            predicted_reward_probs = [
+                F.softmax(logits[0, -1], dim=-1).cpu().numpy() for logits in reward_logits_ensemble
+            ]
+            predicted_reward_logits = [logits[0, -1].cpu().numpy() for logits in reward_logits_ensemble]
+            predicted_reward_logits_ensemble.append(predicted_reward_probs)
+
+            # Perform the environment step with the predicted action
+            predicted_action = predicted_actions[0, -1].cpu().numpy()
+            next_state, instant_reward, done, info = env.step(predicted_action)
+
+            # Store the predicted reward for the episode
+            avg_reward_probs = np.mean(predicted_reward_probs, axis=0)
+            cumulative_probs = np.cumsum(avg_reward_probs)
+            
+            # Find the first grid point where the cumulative probability meets or exceeds the threshold
+            threshold_index = np.searchsorted(cumulative_probs, config.target_value_prob_threshold)
+            
+            # Ensure we don't go out of bounds
+            threshold_index = min(threshold_index, len(reward_grid) - 1)
+            predicted_reward = reward_grid[threshold_index].item()
+
+            # Record the current state, action, reward, and next state
+            episode['observations'].append(state)
+            episode['actions'].append(predicted_action)
+            episode['rewards'].append(instant_reward)
+            episode['next_observations'].append(next_state)
+            episode['done'].append(done)
+
+            # Update the episode tracking variables
+            states[:, step + 1] = torch.as_tensor(next_state, device=device)
+            actions[:, step] = torch.as_tensor(predicted_action, device=device)
+            returns[:, step] = torch.tensor(predicted_reward, dtype=torch.float32, device=device)
+
+            episode_return += instant_reward
+            episode_len += 1
+
+            if done:
+                break
+
+            state = next_state
+
+        # Convert lists to numpy arrays
+        episode['observations'] = np.array(episode['observations'])
+        episode['actions'] = np.array(episode['actions'])
+        episode['rewards'] = np.array(episode['rewards'])
+        episode['next_observations'] = np.array(episode['next_observations'])
+        episode['done'] = np.array(episode['done'])
+
+        # Add the current episode to the list of all episodes
+        all_episodes.append(episode)
+        # Log the episodic return for this episode
+        training_returns.append(episode_return / config.reward_scale)
+
+    # After collecting all episodes, log the mean and std of the training return
+    mean_training_return = np.mean(training_returns)
+    std_training_return = np.std(training_returns)
+
+    wandb.log({
+        "training_return_mean": mean_training_return,
+        "training_return_std": std_training_return,
+    })
+
+    # Return all collected episodes as a list
+    return all_episodes
+
+
 
 
 @pyrallis.wrap()
@@ -642,8 +804,17 @@ def train(config: TrainConfig):
             step=step,
         )
 
+        # Online Interaction: Interact with the environment every 'online_freq' steps
+        if step % config.online_freq == (config.online_freq - 1):
+            model.eval()
+            # Generate an episode by interacting with the environment
+            episode = interact_with_env(eval_env, model, config)
+            # Add the generated episode to the dataset
+            dataset.add_episode(episode)
+            model.train()
+
         # validation in the env for the actual online performance
-        if step % config.eval_every == 0 or step == config.update_steps - 1:
+        if step % config.eval_every == (config.eval_every - 1) or step == config.update_steps - 1:
             model.eval()
             for target_return in config.target_returns:
                 eval_env.seed(config.eval_seed)
