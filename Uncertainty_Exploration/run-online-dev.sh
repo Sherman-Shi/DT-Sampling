@@ -34,6 +34,7 @@ for env in "${environments[@]}"; do
                             --num_reward_heads "$num_heads" \
                             --name "experiment_${env}_heads_${num_heads}_train_seed_${train_seed}_eval_seed_${eval_seed}" \
                             --group "DT-U-D4RL-online_dev" \
+                            --exp_type "entropy_effect"
                             --device "cuda:$gpu_id" \
                             --project "DT_Uncertainty_Exploration" \
                             > "logs/experiment_${env}_heads_${num_heads}_train_${train_seed}_eval_${eval_seed}_pid_$$.log" 2>&1 &

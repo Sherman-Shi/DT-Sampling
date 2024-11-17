@@ -47,6 +47,8 @@ class TrainConfig:
     batch_size: int = 64
     update_steps: int = 100_000
     warmup_steps: int = 100
+    save_model: bool = True 
+    enable_online: bool = False 
     online_freq: int = 200  # Frequency of interacting with the environment and adding a new episode
     online_rollout_num: int = 12
     reward_scale: float = 0.001
@@ -60,6 +62,7 @@ class TrainConfig:
     target_returns: Tuple[float, ...] = (12000.0, 6000.0)
     eval_episodes: int = 10
     eval_every: int = 5_000
+    save_every: int = 5_000
     # general params
     checkpoints_path: Optional[str] = None
     deterministic_torch: bool = False
@@ -69,7 +72,10 @@ class TrainConfig:
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
-        if self.checkpoints_path is not None:
+        # If saving the model, create the path under 'saved_model/'
+        if self.save_model:
+            if self.checkpoints_path is None:
+                self.checkpoints_path = "saved_model"  # Default to "saved_model"
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
 
 
@@ -805,7 +811,7 @@ def train(config: TrainConfig):
         )
 
         # Online Interaction: Interact with the environment every 'online_freq' steps
-        if step % config.online_freq == (config.online_freq - 1):
+        if config.enable_online and step % config.online_freq == (config.online_freq - 1):
             model.eval()
             # Generate an episode by interacting with the environment
             episode = interact_with_env(eval_env, model, config)
@@ -864,13 +870,15 @@ def train(config: TrainConfig):
                 )
             model.train()
 
-    if config.checkpoints_path is not None:
-        checkpoint = {
-            "model_state": model.state_dict(),
-            "state_mean": dataset.state_mean,
-            "state_std": dataset.state_std,
-        }
-        torch.save(checkpoint, os.path.join(config.checkpoints_path, "dt_checkpoint.pt"))
+        if step % config.save_every == (config.save_every - 1) or step == config.update_steps - 1:
+
+            if config.checkpoints_path is not None:
+                checkpoint = {
+                    "model_state": model.state_dict(),
+                    "state_mean": dataset.state_mean,
+                    "state_std": dataset.state_std,
+                }
+                torch.save(checkpoint, os.path.join(config.checkpoints_path, f"dt_checkpoint_step_{step}.pt"))
 
 
 if __name__ == "__main__":
